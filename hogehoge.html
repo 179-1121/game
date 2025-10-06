@@ -1,1 +1,298 @@
 
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>オセロ（vs CPU 高度AI）</title>
+  <style>
+    body { text-align:center; background:#f7f0d9; font-family: Arial, sans-serif; color:#222; }
+    #board { display:grid; grid-template-columns:repeat(8,56px); grid-template-rows:repeat(8,56px); margin:12px auto; border:6px solid #7a4b2b; background:#e6f4d9; }
+    .cell { width:56px; height:56px; border:1px solid #7a4b2b; display:flex; align-items:center; justify-content:center; cursor:pointer; background: #fffef5; }
+    .black, .white { width:44px; height:44px; border-radius:50%; box-shadow: 0 2px 2px rgba(0,0,0,0.15); }
+    .black { background: #0b0b0b; }
+    .white { background: #f6f6f6; border:1px solid #ddd; }
+    #controls { margin-top:14px; }
+    select, input[type=number], button { margin-left:8px; padding:6px 8px; }
+    #info { margin-top:10px; font-weight:600; }
+  </style>
+</head>
+<body>
+  <h1>オセロ（プレイヤー vs CPU）</h1>
+
+  <div id="controls">
+    CPU難易度：
+    <select id="difficulty">
+      <option value="easy">Easy（ランダム）</option>
+      <option value="medium" selected>Medium（多く裏返す手）</option>
+      <option value="hard">Hard（ネガマックス＋αβ）</option>
+    </select>
+    深さ：
+    <input id="depth" type="number" min="1" max="8" value="4" style="width:60px;">
+    <button id="reset">リセット</button>
+  </div>
+
+  <div id="board"></div>
+  <div id="info"></div>
+
+  <script>
+    const SIZE = 8;
+    let board = [];
+    let currentPlayer = 'black'; // プレイヤー = 黒, CPU = 白
+    const directions = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+
+    // 位置重み（角は超重要、コーナー隣接はマイナス）
+    const POS_WEIGHT = [
+      [120, -20, 20, 5, 5, 20, -20, 120],
+      [-20, -40, -5, -5, -5, -5, -40, -20],
+      [20, -5, 15, 3, 3, 15, -5, 20],
+      [5, -5, 3, 3, 3, 3, -5, 5],
+      [5, -5, 3, 3, 3, 3, -5, 5],
+      [20, -5, 15, 3, 3, 15, -5, 20],
+      [-20, -40, -5, -5, -5, -5, -40, -20],
+      [120, -20, 20, 5, 5, 20, -20, 120]
+    ];
+
+    // 初期化
+    function initBoard() {
+      board = Array.from({length: SIZE}, () => Array(SIZE).fill(null));
+      board[3][3] = 'white';
+      board[4][4] = 'white';
+      board[3][4] = 'black';
+      board[4][3] = 'black';
+      currentPlayer = 'black';
+      render();
+      updateInfo();
+    }
+
+    function render() {
+      const boardDiv = document.getElementById('board');
+      boardDiv.innerHTML = '';
+      for (let y=0;y<SIZE;y++){
+        for (let x=0;x<SIZE;x++){
+          const cell = document.createElement('div');
+          cell.className = 'cell';
+          if (board[y][x]) {
+            const s = document.createElement('div');
+            s.className = board[y][x] === 'black' ? 'black' : 'white';
+            cell.appendChild(s);
+          }
+          // クリックは自分のターンのときのみ有効
+          cell.addEventListener('click', () => {
+            if (currentPlayer === 'black') handleClick(x,y);
+          });
+          boardDiv.appendChild(cell);
+        }
+      }
+    }
+
+    function handleClick(x,y) {
+      if (board[y][x] !== null) return;
+      const flips = getFlippedStones(x,y,currentPlayer);
+      if (flips.length === 0) return;
+      applyMove(x,y,currentPlayer,flips);
+      switchTurn();
+    }
+
+    function switchTurn() {
+      currentPlayer = currentPlayer === 'black' ? 'white' : 'black';
+      render();
+      updateInfo();
+
+      if (!hasValidMove(currentPlayer)) {
+        // 相手も打てないなら終了
+        const other = currentPlayer === 'black' ? 'white' : 'black';
+        if (!hasValidMove(other)) {
+          endGame();
+          return;
+        }
+        // パスして手番戻す
+        currentPlayer = other;
+        render();
+        updateInfo();
+        return;
+      }
+
+      if (currentPlayer === 'white') {
+        // CPUの手
+        document.getElementById('info').textContent = 'CPUが思考中...';
+        setTimeout(() => cpuMove(), 50); // 少し遅延を入れてUI更新を確実に
+      }
+    }
+
+    // 選択した難易度でCPUが動く
+    function cpuMove() {
+      const diff = document.getElementById('difficulty').value;
+      const moves = getAllValidMoves('white');
+      if (moves.length === 0) {
+        switchTurn(); // パス
+        return;
+      }
+
+      let chosen;
+      if (diff === 'easy') {
+        chosen = moves[Math.floor(Math.random() * moves.length)];
+      } else if (diff === 'medium') {
+        // 裏返す数が最大の手を選ぶ（貪欲）
+        chosen = moves.reduce((a,b) => (b.flips.length > a.flips.length ? b : a), moves[0]);
+      } else { // hard
+        const depth = parseInt(document.getElementById('depth').value) || 4;
+        chosen = findBestMove(depth, 'white');
+        if (!chosen) chosen = moves[Math.floor(Math.random() * moves.length)];
+      }
+
+      const flips = getFlippedStones(chosen.x, chosen.y, 'white');
+      applyMove(chosen.x, chosen.y, 'white', flips);
+      switchTurn();
+    }
+
+    // 盤上の手を適用（高速に戻せるようflipsを渡す）
+    function applyMove(x,y,player,flips) {
+      board[y][x] = player;
+      flips.forEach(([fx,fy]) => board[fy][fx] = player);
+    }
+    function undoMove(x,y,player,flips) {
+      board[y][x] = null;
+      const opp = player === 'black' ? 'white' : 'black';
+      flips.forEach(([fx,fy]) => board[fy][fx] = opp);
+    }
+
+    // 指定座標に置いたときに裏返る石の座標配列を返す
+    function getFlippedStones(x,y,player) {
+      const opponent = player === 'black' ? 'white' : 'black';
+      let flipped = [];
+      for (const [dx,dy] of directions) {
+        let nx = x + dx, ny = y + dy;
+        let temp = [];
+        while (nx >= 0 && nx < SIZE && ny >= 0 && ny < SIZE && board[ny][nx] === opponent) {
+          temp.push([nx, ny]);
+          nx += dx; ny += dy;
+        }
+        if (temp.length > 0 && nx >= 0 && nx < SIZE && ny >= 0 && ny < SIZE && board[ny][nx] === player) {
+          flipped = flipped.concat(temp);
+        }
+      }
+      return flipped;
+    }
+
+    function hasValidMove(player) {
+      for (let y=0;y<SIZE;y++) for (let x=0;x<SIZE;x++) {
+        if (board[y][x] === null && getFlippedStones(x,y,player).length > 0) return true;
+      }
+      return false;
+    }
+
+    function getAllValidMoves(player) {
+      const moves = [];
+      for (let y=0;y<SIZE;y++) for (let x=0;x<SIZE;x++) {
+        if (board[y][x] === null) {
+          const flips = getFlippedStones(x,y,player);
+          if (flips.length > 0) moves.push({x,y,flips});
+        }
+      }
+      return moves;
+    }
+
+    // 評価関数（player視点で正が有利）
+    function evaluate(player) {
+      const opp = player === 'black' ? 'white' : 'black';
+      // 位置重み
+      let posScore = 0;
+      let blackCount = 0, whiteCount = 0;
+      for (let y=0;y<SIZE;y++){
+        for (let x=0;x<SIZE;x++){
+          if (board[y][x] === 'white') { posScore += POS_WEIGHT[y][x]; whiteCount++; }
+          else if (board[y][x] === 'black') { posScore -= POS_WEIGHT[y][x]; blackCount++; }
+        }
+      }
+      const posForPlayer = player === 'white' ? posScore : -posScore;
+
+      // 可動性（手数差）
+      const myMoves = getAllValidMoves(player).length;
+      const oppMoves = getAllValidMoves(opp).length;
+      const mobility = (myMoves - oppMoves);
+
+      // 石の差（終盤で効く）
+      const diskDiff = (player === 'white' ? whiteCount - blackCount : blackCount - whiteCount);
+
+      // 重みづけ（調整可能）
+      const score = posForPlayer * 1.0 + mobility * 8.0 + diskDiff * 2.0;
+      return score;
+    }
+
+    // ネガマックス（αβ）探索
+    function negamax(player, depth, alpha, beta) {
+      const opp = player === 'black' ? 'white' : 'black';
+      const moves = getAllValidMoves(player);
+
+      // 終端判定（葉ノード）
+      if (depth === 0 || (moves.length === 0 && !hasValidMove(opp))) {
+        return evaluate(player);
+      }
+
+      if (moves.length === 0) {
+        // パス
+        return -negamax(opp, depth, -beta, -alpha);
+      }
+
+      // 手順の簡単な枝刈り（手を裏返す数でソート：良い手から試す）
+      moves.sort((a,b) => b.flips.length - a.flips.length);
+
+      let maxEval = -Infinity;
+      for (const m of moves) {
+        // 適用・再帰・撤回
+        applyMove(m.x, m.y, player, m.flips);
+        const val = -negamax(opp, depth - 1, -beta, -alpha);
+        undoMove(m.x, m.y, player, m.flips);
+
+        if (val > maxEval) maxEval = val;
+        if (val > alpha) alpha = val;
+        if (alpha >= beta) break; // αβカット
+      }
+      return maxEval;
+    }
+
+    // best move を返す（{x,y,flips}かnull）
+    function findBestMove(depth, player) {
+      const moves = getAllValidMoves(player);
+      if (moves.length === 0) return null;
+
+      let bestMove = null;
+      let bestScore = -Infinity;
+      const opp = player === 'black' ? 'white' : 'black';
+
+      // move ordering: 裏返す数が多い順
+      moves.sort((a,b) => b.flips.length - a.flips.length);
+
+      for (const m of moves) {
+        applyMove(m.x, m.y, player, m.flips);
+        const score = -negamax(opp, depth - 1, -Infinity, Infinity);
+        undoMove(m.x, m.y, player, m.flips);
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestMove = m;
+        }
+      }
+      return bestMove;
+    }
+
+    function updateInfo() {
+      const blackCount = board.flat().filter(s => s === 'black').length;
+      const whiteCount = board.flat().filter(s => s === 'white').length;
+      const turnText = currentPlayer === 'black' ? '黒（あなた）の番' : '白（CPU）の番';
+      document.getElementById('info').textContent = `黒: ${blackCount} - 白(CPU): ${whiteCount} | ${turnText}`;
+    }
+
+    function endGame() {
+      const blackCount = board.flat().filter(s => s === 'black').length;
+      const whiteCount = board.flat().filter(s => s === 'white').length;
+      const result = blackCount > whiteCount ? 'あなたの勝ち！' : whiteCount > blackCount ? 'CPUの勝ち！' : '引き分け！';
+      document.getElementById('info').textContent = `ゲーム終了！ 黒: ${blackCount} - 白: ${whiteCount} → ${result}`;
+    }
+
+    // コントロール
+    document.getElementById('reset').addEventListener('click', () => initBoard());
+    initBoard();
+  </script>
+</body>
+</html>
